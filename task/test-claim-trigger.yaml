@@ -1,0 +1,315 @@
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: test-claim-trigger
+  namespace: cicd
+spec:
+  params:
+    - name: release-version
+      type: string
+      default: "2.7"
+    - name: stage
+      type: string
+      default: "integration"
+    - name: downstream
+      type: string
+      default: ""
+    - name: ocp-version
+      type: string
+      default: "4.10"
+    - name: test-snapshot-override
+      type: string
+      default: ""
+    - name: cluster-selector-exclusions
+      type: string
+      default: '46\|47\|49\|48'
+    - name: clusterpool-lifetime
+      type: string
+      default: "8h"
+    - name: build-harness-extensions-branch
+      type: string
+      default: main
+    - name: secrets
+      type: string
+  steps:
+    - image: 'quay.io/gurnben/tekton-runner:latest'
+      name: test-for-latest-snapshot-and-trigger
+      resources: {}
+      env:
+        - name: RELEASE_VERSION
+          value: $(params.release-version)
+        - name: OCP_VERSION
+          value: $(params.ocp-version)
+        - name: STAGE 
+          value: $(params.stage)
+        - name: DOWNSTREAM
+          value: $(params.downstream)
+        - name: TEST_SNAPSHOT_OVERRIDE
+          value: $(params.test-snapshot-override)
+        - name: CLUSTER_SELECTOR_EXCLUSIONS
+          value: $(params.cluster-selector-exclusions)
+        - name: CLUSTERPOOL_LIFETIME
+          value: $(params.clusterpool-lifetime)
+        - name: BUILD_HARNESS_EXTENSIONS_BRANCH
+          value: $(params.build-harness-extensions-branch)
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: $(params.secrets)
+              key: GITHUB_TOKEN
+        - name: TRAVIS_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: $(params.secrets)
+              key: TRAVIS_TOKEN
+        - name: SLACK_URL
+          valueFrom:
+            secretKeyRef:
+              name: $(params.secrets)
+              key: SLACK_URL
+        - name: SLACK_GROUP_ID
+          valueFrom:
+            secretKeyRef:
+              name: $(params.secrets)
+              key: SLACK_GROUP_ID
+        - name: CLUSTERPOOL_HOST_NAMESPACE
+          valueFrom:
+            secretKeyRef:
+              name: $(params.secrets)
+              key: CLUSTERPOOL_HOST_NAMESPACE
+        - name: CLUSTERPOOL_HOST_API
+          valueFrom:
+            secretKeyRef:
+              name: $(params.secrets)
+              key: CLUSTERPOOL_HOST_API
+        - name: CLUSTERPOOL_HOST_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: $(params.secrets)
+              key: CLUSTERPOOL_HOST_TOKEN
+      script: |
+        set +x
+        git clone https://${GITHUB_TOKEN}@github.com/stolostron/pipeline.git
+        cd pipeline
+        git checkout ${RELEASE_VERSION}-integration
+
+        TARGET_MANIFEST=$(find ./snapshots/ | grep -E "manifest-.*[0-9]\.[0-9]{1,}\.[0-9]{1,}\.json" | sort | tail -n 1)
+        TIMESTAMP=$(echo "$TARGET_MANIFEST" | sed -rn "s/\.\/snapshots\/manifest-(.*)-[0-9]\.[0-9]{1,}\.{0,1}[0-9]{1,}\.json/\1/p")
+        TARGET_RELEASE_VERSION=$(echo "$TARGET_MANIFEST" | sed -rn "s/\.\/snapshots\/manifest-.*-([0-9]\.[0-9]{1,}\.{0,1}[0-9]{1,})\.json/\1/p")
+        SNAPSHOT=${TARGET_RELEASE_VERSION}-SNAPSHOT-${TIMESTAMP}
+        export OPENSHIFT_BASE_DOMAIN=aws.red-chesterfield.com
+
+        # DANGER!  REMOVE ME WHEN HIVE IS NOT ON CRACK!
+        export CLUSTERPOOL_CHECKOUT_TIMEOUT_MINUTES=40
+
+        touch LAST_SNAPSHOT
+        curl --silent \
+            -H "travis-API-Version: 3" \
+            -H "User-Agent: API Explorer" \
+            -H "Authorization: token $TRAVIS_TOKEN" \
+            https://api.travis-ci.com/repo/13510528/branch/${RELEASE_VERSION}-${STAGE}?include=branch.last_build | grep message > LAST_SNAPSHOT
+
+        cat LAST_SNAPSHOT
+        if grep $SNAPSHOT LAST_SNAPSHOT; then
+          echo LATEST SNAPSHOT MATCHED OLD SNAPSHOT
+            git clone https://${GITHUB_TOKEN}@github.com/stolostron/pipeline.git
+            cd pipeline
+            git checkout ${RELEASE_VERSION}-dev
+            find ./snapshots/
+            ls
+            EDGE_MANIFEST=$(find ./snapshots/ | grep -E "manifest-.*[0-9]\.[0-9]\.[0-9]{0,1}\.json" | sort | tail -n 1)
+            EDGE_TIMESTAMP=$(echo "$EDGE_MANIFEST" | sed -rn "s/\.\/snapshots\/manifest-(.*)-[0-9]\.[0-9]\.{0,1}[0-9]{0,1}\.json/\1/p")
+            EDGE_RELEASE_VERSION=$(echo "$EDGE_MANIFEST" | sed -rn "s/\.\/snapshots\/manifest-.*-([0-9]\.[0-9]\.{0,1}[0-9]{0,1})\.json/\1/p")
+            export EDGE_SNAPSHOT=${EDGE_RELEASE_VERSION}-SNAPSHOT-${EDGE_TIMESTAMP}
+            cd ..
+            if [[ "$EDGE_TIMESTAMP" == "" || "$EDGE_RELEASE_VERSION" == "" ]]; then
+                echo "{'text': '*|$RELEASE_VERSION.X Integration|* :checkyes:  No new snapshots to canary.  No snapshots previously promoted to dev.'}" > ./slack_message.json
+            else
+              echo "{'text': '*|$RELEASE_VERSION.X Integration|* :checkyes:  No new snapshots to canary.  Last snapshot promoted to dev is \`$EDGE_SNAPSHOT\`'}" > ./slack_message.json
+            fi
+            curl -X POST -H 'Content-type: application/json' --data @slack_message.json $SLACK_URL
+          exit 1
+        fi
+
+        # Check for the existence of an index image - die noisily if not
+        INDEX_IMAGE_NAME="acm-custom-registry"
+        if [[ -z "$DOWNSTREAM" ]]
+        then
+            INDEX_IMAGE_REPO="stolostron"
+        else
+            INDEX_IMAGE_REPO="acm-d"
+        fi
+        INDEX_IMAGE_QUAY_URL="https://quay.io/api/v1/repository/$INDEX_IMAGE_REPO/$INDEX_IMAGE_NAME/tag/?onlyActiveTags=true&specificTag=$SNAPSHOT"
+        curl_command="curl -s -X GET \"$INDEX_IMAGE_QUAY_URL\""
+
+        function try_sha_retrieval {
+          sha_value=$(eval "$curl_command | jq -r .tags[0].manifest_digest")
+          if [[ "null" = "$sha_value" ]]
+          then
+            # We didn't find an image with that tag
+            return 1
+          else
+            # Found it
+            return 0
+          fi
+        }
+
+        function seek_index {
+          local n=1
+          local max=3
+          local delay=300
+          while true; do
+            try_sha_retrieval && break || {
+              if [[ $n -lt $max ]]; then
+                ((n++))
+                echo "Index image retrieval failed. Sleeping $delay seconds before attempt $n/$max:"
+                sleep $delay;
+              else
+                echo Oh no, can\'t retrieve index image from $SNAPSHOT, expected to find it here: $INDEX_IMAGE_QUAY_URL
+                cat << EOF > slack_message.json
+        {'text': '*|${RELEASE_VERSION}.X Integration|* :broken-image: Index image for $SNAPSHOT didn\'t get created, and as luck would have it, we tried to deploy it.  See job: $BUILD_URL'}
+        EOF
+                curl -X POST -H 'Content-type: application/json' --data @slack_message.json $SLACK_URL
+                exit 1
+              fi
+            }
+          done
+        }
+        echo Checking for existence of index image $INDEX_IMAGE_QUAY_URL
+        seek_index
+        echo Index for $SNAPSHOT exists.
+
+        git clone --single-branch --branch main https://${GITHUB_TOKEN}@github.com/stolostron/build-harness-bootstrap.git
+        cp build-harness-bootstrap/Makefile .
+        rm -rf build-harness-bootstrap
+        make init BUILD_HARNESS_EXTENSIONS_BRANCH=$BUILD_HARNESS_EXTENSIONS_BRANCH
+        make clusterpool/_list-active-clusterpools CLUSTERPOOL_LIST_ARGUMENTS=" -o json" \
+            CLUSTER_SELECTOR_EXCLUSIONS=$CLUSTER_SELECTOR_EXCLUSIONS > shuffled_available_clusterpools.txt
+        cat shuffled_available_clusterpools.txt
+
+        make clusterpool/_checkout-two
+        HUB_CLUSTER_CLAIM=$(cat HUB_CLUSTER_CLAIM 2> /dev/null)
+        IMPORT_CLUSTER_CLAIM=$(cat IMPORT_CLUSTER_CLAIM 2> /dev/null)
+
+        if [[ "$IMPORT_CLUSTER_CLAIM" == "" || "$HUB_CLUSTER_CLAIM" == "" ]]; then
+          echo Cluster checkout failed.  Exiting.
+            exit 1
+        fi
+
+        # Install OC
+        echo "Pulling oc cli from https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/openshift-client-linux.tar.gz"
+        curl -L https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/openshift-client-linux.tar.gz | tar -zx
+
+        # Poll to make sure that Hub and Import are unhibernated successfully and can be logged into
+        HUB_API_URL=$(make clusterpool/get-cluster-api CLUSTERPOOL_CLUSTER_CLAIM=$HUB_CLUSTER_CLAIM)
+        HUB_USER=$(make clusterpool/get-cluster-username CLUSTERPOOL_CLUSTER_CLAIM=$HUB_CLUSTER_CLAIM)
+        HUB_PASS=$(make clusterpool/get-cluster-password CLUSTERPOOL_CLUSTER_CLAIM=$HUB_CLUSTER_CLAIM)
+        hub_success=1
+
+        IMPORT_API_URL=$(make clusterpool/get-cluster-api CLUSTERPOOL_CLUSTER_CLAIM=$IMPORT_CLUSTER_CLAIM)
+        IMPORT_USER=$(make clusterpool/get-cluster-username CLUSTERPOOL_CLUSTER_CLAIM=$IMPORT_CLUSTER_CLAIM)
+        IMPORT_PASS=$(make clusterpool/get-cluster-password CLUSTERPOOL_CLUSTER_CLAIM=$IMPORT_CLUSTER_CLAIM)
+        import_success=1
+
+        wait_max=600
+        wait_time=0
+        # Poll for 5 minutes, attempting login every 30 seconds
+        while [[ ( $wait_time -lt $wait_max ) && ( ( "$hub_success" != 0 ) || ( "$import_success" != 0 ) ) ]]; do
+            if [[ "$hub_success" != 0 ]]; then
+                ./oc login $HUB_API_URL -u $HUB_USER -p $HUB_PASS --insecure-skip-tls-verify=true
+                if [[ "$?" == 0 ]]; then
+                    hub_success=0
+                    echo "Hub is alive - successfully logged in."
+                fi
+            fi
+            if [[ "$import_success" != 0 ]]; then
+                ./oc login $IMPORT_API_URL -u $IMPORT_USER -p $IMPORT_PASS --insecure-skip-tls-verify=true
+                if [[ "$?" == 0 ]]; then
+                    import_success=0
+                    echo "Import is alive - successfully logged in."
+                fi
+            fi
+            if [[ "$hub_success" != 0 || "$import_success" != 0 ]]; then
+                wait_time=$((wait_time+30))
+                echo "Waited $wait_time/$wait_max seconds for oc login to succeed on hub and import."
+                sleep 30
+            fi
+        done
+
+        # Fail on unhibernate failure
+        if [[ "$hub_success" != 0 || "$import_success" != 0 || "$wait_time" -ge "$wait_max" ]]; then
+            if [[ "$hub_success" != 0 ]]; then
+                echo "Hub failed to resume from hibernate within 5 minutes.  Failing."
+            fi
+            if [[ "$import_success" != 0 ]]; then
+                echo "Import failed to resume from hibernate within 5 minutes.  Failing."
+            fi
+            cat << EOF > slack_message.json
+        {'text': '*|${RELEASE_VERSION}.X Integration|* :wrench:  ClusterPool clusters failed to come online after checkout. See job: $BUILD_URL CICD needs to take a look!'}
+        EOF
+            curl -X POST -H 'Content-type: application/json' --data @slack_message.json $SLACK_URL
+            make clusterpool/checkin CLUSTERPOOL_CLUSTER_CLAIM=$HUB_CLUSTER_CLAIM
+            make clusterpool/checkin CLUSTERPOOL_CLUSTER_CLAIM=$IMPORT_CLUSTER_CLAIM
+            exit 1
+        fi
+
+        if [[ $(echo $IMPORT_CLUSTER_CLAIM | grep "aws") ]]; then
+          IMPORT_CLOUD_PLATFORM="aws"
+        elif [[ $(echo $IMPORT_CLUSTER_CLAIM | grep "gcp") ]]; then
+          IMPORT_CLOUD_PLATFORM="gcp"
+        elif [[ $(echo $IMPORT_CLUSTER_CLAIM | grep "azure") ]]; then
+          IMPORT_CLOUD_PLATFORM="azure"
+        else
+          IMPORT_CLOUD_PLATFORM="unknown"
+        fi
+        export BOOTSTRAP_KS_DEBUG="true"
+        make bootstrap-ks/clusterclaim-save-secret-from-claim \
+          BOOTSTRAP_KS_HOST_API=$CLUSTERPOOL_HOST_API \
+            BOOTSTRAP_KS_HOST_TOKEN=$CLUSTERPOOL_HOST_TOKEN \
+            BOOTSTRAP_KS_CC_NAMESPACE=$CLUSTERPOOL_HOST_NAMESPACE \
+            BOOTSTRAP_KS_CC_NAME=$IMPORT_CLUSTER_CLAIM \
+            BOOTSTRAP_KS_CLUSTER_NAME=$IMPORT_CLUSTER_CLAIM \
+            BOOTSTRAP_KS_CLOUD_PLATFORM=$IMPORT_CLOUD_PLATFORM
+            
+        if [[ $(echo $HUB_CLUSTER_CLAIM | grep "aws") ]]; then
+          HUB_CLOUD_PLATFORM="aws"
+        elif [[ $(echo $HUB_CLUSTER_CLAIM | grep "gcp") ]]; then
+          HUB_CLOUD_PLATFORM="gcp"
+        elif [[ $(echo $HUB_CLUSTER_CLAIM | grep "azure") ]]; then
+          HUB_CLOUD_PLATFORM="azure"
+        else
+          HUB_CLOUD_PLATFORM="unknown"
+        fi
+        export BOOTSTRAP_KS_DEBUG="true"
+        make bootstrap-ks/clusterclaim-save-secret-from-claim \
+          BOOTSTRAP_KS_HOST_API=$CLUSTERPOOL_HOST_API \
+            BOOTSTRAP_KS_HOST_TOKEN=$CLUSTERPOOL_HOST_TOKEN \
+            BOOTSTRAP_KS_CC_NAMESPACE=$CLUSTERPOOL_HOST_NAMESPACE \
+            BOOTSTRAP_KS_CC_NAME=$HUB_CLUSTER_CLAIM \
+            BOOTSTRAP_KS_CLUSTER_NAME=$HUB_CLUSTER_CLAIM \
+            BOOTSTRAP_KS_CLOUD_PLATFORM=$HUB_CLOUD_PLATFORM
+
+        echo "HUB_CLUSTER_CLAIM: $HUB_CLUSTER_CLAIM, IMPORT_CLUSTER_NAMES: $IMPORT_CLUSTER_CLAIM"
+
+        git config --global user.email "acm-cicd+acm-canary-bot@redhat.com"
+        git config --global user.name "acm-canary-bot"
+        echo "Triggering a canary on $SNAPSHOT with Hub=$HUB_CLUSTER_CLAIM and Import=$IMPORT_CLUSTER_CLAIM."
+        git clone https://${GITHUB_TOKEN}@github.com/stolostron/canary.git
+        cd canary
+        git checkout ${RELEASE_VERSION}-${STAGE}
+        echo "$DOWNSTREAM" > DOWNSTREAM
+        echo "$DEPLOY_REPO" > DEPLOY_ORG
+        echo "$TEST_SNAPSHOT_OVERRIDE" > TEST_SNAPSHOT_OVERRIDE
+        echo "$BUILD_HARNESS_EXTENSIONS_BRANCH" > BUILD_HARNESS_EXTENSIONS_BRANCH
+        echo $HUB_CLUSTER_CLAIM > HUB_CLUSTER_NAME
+        echo $IMPORT_CLUSTER_CLAIM > IMPORT_CLUSTER_NAMES
+        echo $SNAPSHOT > SNAPSHOT
+        echo $OCP_VERSION > OCP_VERSION
+        echo $TARGET_RELEASE_VERSION > OCM_RELEASE_VERSION
+        echo $TIMESTAMP > TIMESTAMP
+        echo $SLACK_CHANNEL > SECONDARY_SLACK_CHANNEL
+        echo $SLACK_TS > SECONDARY_SLACK_TS
+        echo $(date -I"seconds") > trigger_file
+        git commit -am "Triggering a canary on $SNAPSHOT with Hub=$HUB_CLUSTER_CLAIM and Import=$IMPORT_CLUSTER_CLAIM."
+        git push
+        cd ..

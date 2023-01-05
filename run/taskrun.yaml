@@ -1,0 +1,11 @@
+apiVersion: tekton.dev/v1beta1
+kind: TaskRun
+metadata:
+  generateName: test-claim-trigger-taskrun-
+spec:
+  serviceAccountName: verification-test-sa
+  params:
+    - name: secrets
+      value: verification-test-trigger-secret
+  taskRef:
+    name: test-claim-trigger
